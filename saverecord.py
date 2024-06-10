@@ -16,12 +16,12 @@ def main(baudrate:int = 9600):
     df = df.set_index("timestamp",drop=True)
     while True:
 
-        now = datetime.datetime.now()
         file_name = "record/"+foldername+"/record.csv"
         print("start!")
         while True:
             # gets now time
-            now = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             voltage = str(com.readline().decode("utf-8"))
             df.loc[now] = [voltage]
             df.to_csv(file_name)
