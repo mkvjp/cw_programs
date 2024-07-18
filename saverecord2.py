@@ -23,7 +23,6 @@ def main(baudrate:int = 9600):
             print("1 hour has passed. Ending loop.")
             break
 
-        file_name = "record/" + foldername + "/record.csv"
         # gets now time
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         voltage = str(com.readline().decode("utf-8"))
