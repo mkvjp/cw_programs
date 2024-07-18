@@ -35,7 +35,7 @@ void loop()
 {
   while (1){
     int adc = analogRead(A0);
-    if (adc >=100){ Serial.println((String)adc+" "+400);count = 0;}
+    if (adc >=200){ Serial.println((String)adc+" "+400);count = 0;}
     else{count++;
     if(count%960==0)Serial.println((String)adc+" "+400);}
    
