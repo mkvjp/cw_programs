@@ -10,8 +10,7 @@ def main(baudrate:int = 9600):
     comname = "/dev/tty.usbserial-14110" #winならCOM13とか
     com = serial.Serial(comname,baudrate)
     os.makedirs(f"record",exist_ok=True)
-    foldername = comname+datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    os.makedirs(f"record/"+foldername, exist_ok=True)
+    file_name = "record/" +  comname+datetime.datetime.now().strftime('%Y%m%d_%H%M%S') + ".csv"
     df = pd.DataFrame(columns=['timestamp','voltage'])
     df = df.set_index("timestamp",drop=True)
 
@@ -24,8 +23,7 @@ def main(baudrate:int = 9600):
         if time.time() - start_time > duration:
             print("1 hour has passed. Ending loop.")
             break
-
-        file_name = "record/"+foldername+"/record.csv"
+        
         print("start!")
         while True:
             # gets now time
