@@ -15,7 +15,7 @@ def main(baudrate:int = 9600):
     df = df.set_index("timestamp", drop=True)
 
     start_time = datetime.datetime.now()
-    duration = datetime.timedelta(hours=1)
+    duration = datetime.timedelta(hours=24)
 
     print("start!")
     while True:
