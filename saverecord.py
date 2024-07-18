@@ -14,17 +14,17 @@ def main(baudrate:int = 9600):
     df = pd.DataFrame(columns=['timestamp','voltage'])
     df = df.set_index("timestamp",drop=True)
 
-    start_time = time.time()
-    duration = 60 * 60  # 1 hour in seconds
+    start_time = datetime.datetime.now()
+    duration = datetime.timedelta(hours=1)
 
     print("start!")
     while True:
 
-        if time.time() - start_time > duration:
+        if datetime.datetime.now() - start_time > duration:
             print("1 hour has passed. Ending loop.")
             break
         
-        print("start!")
+
         while True:
             # gets now time
             
