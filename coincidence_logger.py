@@ -24,6 +24,9 @@ Raspberry Pi 4 の USB に接続し、各ポートのイベントを1つのCSV�
   device_us     : 巻き戻し補正済みのボード時刻 (us)。オフライン再フィット用
   adc           : ADC値
 
+運用ログ (coincidence_日時_log.txt):
+  開始/停止/シリアルエラー/再接続の記録。タイムスタンプ付きの1行テキスト。
+
 ポート対応CSV (coincidence_日時_ports.csv) — 開始時に1回書き出す対応表:
   port    : ボード固有名 (イベント/同期CSVのport列と同じ)
   by_id   : /dev/serial/by-id/ のフルネーム (ボード個体に紐づく)
@@ -64,6 +67,8 @@ SYNC_INTERVAL_S = 2.0      # 'T' を送る間隔 (Nano Every は内蔵RC発振�
 STARTUP_SYNCS = 6          # 起動直後はこの回数だけ0.5s間隔で密に同期する
 STARTUP_SYNC_INTERVAL_S = 0.5
 BOOT_WAIT_S = 2.5          # ポートを開くとボードがリセットされるので待つ
+RECONNECT_INTERVAL_S = 3.0 # USB切断時に再接続を試みる間隔
+SYNC_TIMEOUT_NS = 2_000_000_000  # 同期応答をこれ以上待ったら諦めて次を送る
 MICROS_WRAP = 2 ** 32      # micros() の一周
 CAL_POINTS = 10            # フィットに使う直近の同期点数
 RTT_ACCEPT_NS = 4_000_000  # RTTがこれ(4ms)を超える同期点は較正に使わない
@@ -147,15 +152,59 @@ class PortWorker(threading.Thread):
         self.ser = serial.Serial(self.port, BAUD, timeout=1)
 
     def send_sync(self):
+        ser = self.ser
+        if ser is None:
+            return  # 切断中
+        now = time.time_ns()
         with self.lock:
-            if self.pending_sync_ns is not None:
-                return  # 前回の応答待ち
-            self.pending_sync_ns = time.time_ns()
+            # 前回の応答待ち (ただし応答が失われた場合に備えてタイムアウト付き)
+            if (self.pending_sync_ns is not None
+                    and now - self.pending_sync_ns < SYNC_TIMEOUT_NS):
+                return
+            self.pending_sync_ns = now
         try:
-            self.ser.write(b'T')
-        except serial.SerialException:
+            ser.write(b'T')
+        except (serial.SerialException, OSError):
             with self.lock:
                 self.pending_sync_ns = None
+
+    def reset_clock_state(self):
+        """再接続時に呼ぶ。ポートを開き直すとボードがリセットされて
+        micros()が0からやり直しになるので、時計関連の状態を全て初期化する"""
+        self.wraps = 0
+        self.last_micros = None
+        self.clock = ClockModel()
+        self.last_used_ns = None
+        with self.lock:
+            self.pending_sync_ns = None
+
+    def reconnect(self):
+        """切断されたポートに再接続できるまで試み続ける。停止要求でFalse"""
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+        while not self.stop_event.is_set():
+            self.stop_event.wait(RECONNECT_INTERVAL_S)
+            try:
+                ser = serial.Serial(self.port, BAUD, timeout=1)
+                time.sleep(BOOT_WAIT_S)  # 開くとボードがリセットされるので起動を待つ
+                ser.reset_input_buffer()
+            except (serial.SerialException, OSError):
+                continue
+            self.reset_clock_state()
+            self.ser = ser
+            self.log('再接続しました')
+            return True
+        return False
+
+    def log(self, msg):
+        """運用ログ: コンソールとログファイル(キュー経由)の両方に残す"""
+        print(f'[{self.label}] {msg}', file=sys.stderr)
+        self.out_queue.put({'type': 'L', 'host_recv_ns': time.time_ns(),
+                            'msg': f'[{self.label}] {msg}'})
 
     def unwrap(self, m):
         if self.last_micros is not None and m < self.last_micros - MICROS_WRAP // 2:
@@ -165,11 +214,19 @@ class PortWorker(threading.Thread):
 
     def run(self):
         while not self.stop_event.is_set():
+            if self.ser is None:
+                if not self.reconnect():
+                    return
             try:
                 line = self.ser.readline()
-            except serial.SerialException as e:
-                print(f"[{self.port}] シリアルエラー: {e}", file=sys.stderr)
-                break
+            except (serial.SerialException, OSError) as e:
+                self.log(f'シリアルエラー: {e} -> 再接続を試みます')
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+                continue
             recv_ns = time.time_ns()
             if not line:
                 continue
@@ -247,6 +304,7 @@ def main():
     base = out_name[:-4] if out_name.endswith('.csv') else out_name
     sync_name = base + '_sync.csv'
     ports_name = base + '_ports.csv'
+    log_name = base + '_log.txt'
 
     # ボード固有名・物理ポート位置・実デバイスの対応表を書き出す
     with open(ports_name, 'w', newline='') as f:
@@ -265,11 +323,16 @@ def main():
 
     workers = [PortWorker(p, q, stop_event) for p in ports]
     for w in workers:
-        w.open()
+        try:
+            w.open()
+        except (serial.SerialException, OSError) as e:
+            w.log(f'接続できません: {e} -> バックグラウンドで再接続を試みます')
+            w.ser = None
     print(f'ボードのリセット待ち {BOOT_WAIT_S}s ...')
     time.sleep(BOOT_WAIT_S)
     for w in workers:
-        w.ser.reset_input_buffer()
+        if w.ser is not None:
+            w.ser.reset_input_buffer()
         w.start()
 
     deadline = time.time() + args.hours * 3600 if args.hours > 0 else None
@@ -283,7 +346,13 @@ def main():
     last_fsync = 0.0
     try:
         with open(out_name, 'w', newline='') as f_ev, \
-             open(sync_name, 'w', newline='') as f_sy:
+             open(sync_name, 'w', newline='') as f_sy, \
+             open(log_name, 'w') as f_log:
+
+            def write_log(msg, ts=None):
+                f_log.write(f'{iso(ts if ts is not None else time.time_ns())} {msg}\n')
+                f_log.flush()
+
             # ボードと物理ポートの対応をコメント行として先頭に残す (保険)
             for p in ports:
                 f_ev.write(f'# board {board_label(p)} at {by_path_name(p) or "?"}'
@@ -293,10 +362,12 @@ def main():
             sy_writer = csv.DictWriter(f_sy, fieldnames=sync_fields)
             sy_writer.writeheader()
             print(f'記録開始 -> {out_name} / {sync_name} (Ctrl+Cで停止)')
+            write_log('記録開始 ' + ' '.join(board_label(p) for p in ports))
             while True:
                 now = time.time()
                 if deadline and now >= deadline:
                     print('指定時間に達したので停止します')
+                    write_log('指定時間に達したので停止')
                     break
                 # 同時送信するとUSBバス上で応答が競合してRTTが膨らむので、
                 # ポートごとに時間をずらして1台ずつ同期する (ラウンドロビン)。
@@ -319,17 +390,25 @@ def main():
                     n_events += 1
                     if n_events % 100 == 0:
                         print(f'イベント {n_events} 件')
-                else:
+                elif kind == 'S':
                     row['host_recv_iso'] = iso(row['host_recv_ns'])
                     sy_writer.writerow(row)
                     f_sy.flush()
+                else:  # 'L': 切断・再接続などの運用ログ
+                    write_log(row['msg'], ts=row['host_recv_ns'])
                 # 電源断対策: 1秒に1回ディスクへ強制書き込み
                 if now - last_fsync >= 1.0:
                     last_fsync = now
                     os.fsync(f_ev.fileno())
                     os.fsync(f_sy.fileno())
+                    os.fsync(f_log.fileno())
     except KeyboardInterrupt:
         print('\n停止します')
+        try:
+            with open(log_name, 'a') as f_log:
+                f_log.write(f'{iso(time.time_ns())} Ctrl+Cで停止\n')
+        except OSError:
+            pass
     finally:
         stop_event.set()
         for w in workers:
