@@ -10,16 +10,23 @@ Raspberry Pi 4 の USB に接続し、各ポートのイベントを1つのCSV�
 'T' を送って往復時間の中点でボード時計とホスト時計の対応点を取り、
 最小二乗フィット(オフセット+ドリフト)で共通時間軸に変換する。
 
-CSVの列:
-  host_recv_iso   : ホストが行を受信した時刻 (ISO形式)
-  host_recv_ns    : 同上 (UNIXナノ秒)
-  port            : シリアルポート名 (/dev/ttyACM0 など)
-  type            : E=イベント, S=同期応答
-  device_micros   : ボードのmicros()生値
-  device_us       : 巻き戻し補正済みのボード時刻 (us)
-  adc             : ADC値 (イベント行のみ)
-  est_event_ns    : イベント発生時刻のホスト時計換算 (UNIXナノ秒, 較正済み)
-  sync_rtt_us     : 同期の往復時間 (同期行のみ, 較正品質の目安)
+出力は2ファイル:
+
+イベントCSV (coincidence_日時.csv) — 解析用:
+  est_event_iso : イベント発生時刻のホスト時計換算 (ISO形式)
+  est_event_ns  : 同上 (UNIXナノ秒)。コインシデンス探索はこの列同士を比較する
+  port          : シリアルポート名 (/dev/ttyACM0 など)
+  device_us     : 巻き戻し補正済みのボード時刻 (us)。オフライン再フィット用
+  adc           : ADC値
+
+同期CSV (coincidence_日時_sync.csv) — 較正記録・再フィット用の保険:
+  host_recv_iso : 同期応答を受信した時刻 (ISO形式)
+  host_recv_ns  : 同上 (UNIXナノ秒)
+  port          : シリアルポート名
+  device_us     : ボード時刻 (us)
+  mid_host_ns   : 往復の中点 = device_usに対応するホスト時刻の推定 (UNIXナノ秒)
+  rtt_us        : 往復時間 (較正品質の目安)
+  used          : 1=較正に使用, 0=RTT大のため除外
 
 使い方:
   pip install pyserial
@@ -41,10 +48,13 @@ import time
 import serial
 
 BAUD = 115200
-SYNC_INTERVAL_S = 10.0     # 'T' を送る間隔
+SYNC_INTERVAL_S = 2.0      # 'T' を送る間隔 (Nano Every は内蔵RC発振で~0.5%ドリフトするので短め)
+STARTUP_SYNCS = 6          # 起動直後はこの回数だけ0.5s間隔で密に同期する
+STARTUP_SYNC_INTERVAL_S = 0.5
 BOOT_WAIT_S = 2.5          # ポートを開くとボードがリセットされるので待つ
 MICROS_WRAP = 2 ** 32      # micros() の一周
-CAL_POINTS = 6             # フィットに使う直近の同期点数
+CAL_POINTS = 10            # フィットに使う直近の同期点数
+RTT_ACCEPT_NS = 4_000_000  # RTTがこれ(4ms)を超える同期点は較正に使わない
 
 
 class ClockModel:
@@ -135,10 +145,11 @@ class PortWorker(threading.Thread):
                     continue
                 device_us = self.unwrap(m)
                 est = self.clock.estimate(device_us)
+                if est is None:
+                    est = recv_ns  # 較正前(開始直後~0.5s)のみ受信時刻で代用
                 self.out_queue.put({
-                    'host_recv_ns': recv_ns, 'port': self.port, 'type': 'E',
-                    'device_micros': m, 'device_us': device_us,
-                    'adc': adc, 'est_event_ns': est, 'sync_rtt_us': '',
+                    'type': 'E', 'est_event_ns': est, 'port': self.port,
+                    'device_us': device_us, 'adc': adc,
                 })
 
             elif parts[0] == 'S' and len(parts) == 2:
@@ -154,12 +165,15 @@ class PortWorker(threading.Thread):
                     continue
                 rtt_ns = recv_ns - t_send
                 mid_ns = t_send + rtt_ns // 2
-                self.clock.add(device_us, mid_ns)
+                # RTTが大きい同期点は中点の不確かさも大きいので較正から除外
+                # (ただし較正点がまだ少ないうちは受け入れる)
+                used = rtt_ns <= RTT_ACCEPT_NS or len(self.clock.points) < 2
+                if used:
+                    self.clock.add(device_us, mid_ns)
                 self.out_queue.put({
-                    'host_recv_ns': recv_ns, 'port': self.port, 'type': 'S',
-                    'device_micros': m, 'device_us': device_us,
-                    'adc': '', 'est_event_ns': mid_ns,
-                    'sync_rtt_us': rtt_ns // 1000,
+                    'type': 'S', 'host_recv_ns': recv_ns, 'port': self.port,
+                    'device_us': device_us, 'mid_host_ns': mid_ns,
+                    'rtt_us': rtt_ns // 1000, 'used': int(used),
                 })
 
 
@@ -184,6 +198,8 @@ def main():
     print(f'使用ポート: {", ".join(ports)}')
 
     out_name = args.out or time.strftime('coincidence_%Y%m%d_%H%M%S.csv')
+    base = out_name[:-4] if out_name.endswith('.csv') else out_name
+    sync_name = base + '_sync.csv'
     stop_event = threading.Event()
     q = queue.Queue()
 
@@ -198,41 +214,54 @@ def main():
 
     deadline = time.time() + args.hours * 3600 if args.hours > 0 else None
 
-    fields = ['host_recv_iso', 'host_recv_ns', 'port', 'type',
-              'device_micros', 'device_us', 'adc', 'est_event_iso', 'est_event_ns', 'sync_rtt_us']
+    event_fields = ['est_event_iso', 'est_event_ns', 'port', 'device_us', 'adc']
+    sync_fields = ['host_recv_iso', 'host_recv_ns', 'port',
+                   'device_us', 'mid_host_ns', 'rtt_us', 'used']
     n_events = 0
+    n_syncs = 0
     last_sync = 0.0
     last_fsync = 0.0
     try:
-        with open(out_name, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            print(f'記録開始 -> {out_name} (Ctrl+Cで停止)')
+        with open(out_name, 'w', newline='') as f_ev, \
+             open(sync_name, 'w', newline='') as f_sy:
+            ev_writer = csv.DictWriter(f_ev, fieldnames=event_fields)
+            ev_writer.writeheader()
+            sy_writer = csv.DictWriter(f_sy, fieldnames=sync_fields)
+            sy_writer.writeheader()
+            print(f'記録開始 -> {out_name} / {sync_name} (Ctrl+Cで停止)')
             while True:
                 now = time.time()
                 if deadline and now >= deadline:
                     print('指定時間に達したので停止します')
                     break
-                if now - last_sync >= SYNC_INTERVAL_S:
+                # 起動直後は密に同期してドリフト(傾き)を早く確定させる
+                interval = STARTUP_SYNC_INTERVAL_S if n_syncs < STARTUP_SYNCS else SYNC_INTERVAL_S
+                if now - last_sync >= interval:
                     last_sync = now
+                    n_syncs += 1
                     for w in workers:
                         w.send_sync()
                 try:
                     row = q.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                row['host_recv_iso'] = iso(row['host_recv_ns'])
-                row['est_event_iso'] = iso(row['est_event_ns'])
-                writer.writerow(row)
-                f.flush()
-                # 電源断対策: 1秒に1回ディスクへ強制書き込み
-                if now - last_fsync >= 1.0:
-                    last_fsync = now
-                    os.fsync(f.fileno())
-                if row['type'] == 'E':
+                kind = row.pop('type')
+                if kind == 'E':
+                    row['est_event_iso'] = iso(row['est_event_ns'])
+                    ev_writer.writerow(row)
+                    f_ev.flush()
                     n_events += 1
                     if n_events % 100 == 0:
                         print(f'イベント {n_events} 件')
+                else:
+                    row['host_recv_iso'] = iso(row['host_recv_ns'])
+                    sy_writer.writerow(row)
+                    f_sy.flush()
+                # 電源断対策: 1秒に1回ディスクへ強制書き込み
+                if now - last_fsync >= 1.0:
+                    last_fsync = now
+                    os.fsync(f_ev.fileno())
+                    os.fsync(f_sy.fileno())
     except KeyboardInterrupt:
         print('\n停止します')
     finally:
