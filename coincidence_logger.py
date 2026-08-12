@@ -13,11 +13,22 @@ Raspberry Pi 4 の USB に接続し、各ポートのイベントを1つのCSV�
 出力は2ファイル:
 
 イベントCSV (coincidence_日時.csv) — 解析用:
+  先頭に「# board <ボード固有名> at <物理ポート位置> (<実デバイス>)」の
+  コメント行が入る (単体で対応関係が分かる保険)。
+  pandasで読むときは pd.read_csv(f, comment='#') とする。
   est_event_iso : イベント発生時刻のホスト時計換算 (ISO形式)
   est_event_ns  : 同上 (UNIXナノ秒)。コインシデンス探索はこの列同士を比較する
-  port          : シリアルポート名 (/dev/ttyACM0 など)
+  port          : ボード固有名 (Nano Everyのシリアル番号)。USBの挿し場所を
+                  変えても同じボードなら同じ名前になる。/dev/serial/by-id/ が
+                  無い環境では /dev/ttyACM0 などにフォールバック
   device_us     : 巻き戻し補正済みのボード時刻 (us)。オフライン再フィット用
   adc           : ADC値
+
+ポート対応CSV (coincidence_日時_ports.csv) — 開始時に1回書き出す対応表:
+  port    : ボード固有名 (イベント/同期CSVのport列と同じ)
+  by_id   : /dev/serial/by-id/ のフルネーム (ボード個体に紐づく)
+  by_path : /dev/serial/by-path/ の名前 (ラズパイの物理ポート位置に紐づく)
+  dev     : 実デバイス (/dev/ttyACM0 など, 起動ごとに変わりうる)
 
 同期CSV (coincidence_日時_sync.csv) — 較正記録・再フィット用の保険:
   host_recv_iso : 同期応答を受信した時刻 (ISO形式)
@@ -41,6 +52,7 @@ import csv
 import glob
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -56,6 +68,32 @@ MICROS_WRAP = 2 ** 32      # micros() の一周
 CAL_POINTS = 10            # フィットに使う直近の同期点数
 RTT_ACCEPT_NS = 4_000_000  # RTTがこれ(4ms)を超える同期点は較正に使わない
 STALE_ACCEPT_NS = 10_000_000_000  # ただし10s以上採用点がない場合はRTTが大きくても受け入れる
+
+
+def find_ports():
+    """ボード固有名(/dev/serial/by-id)を優先し、無ければ/dev/ttyACM*を使う"""
+    ports = sorted(glob.glob('/dev/serial/by-id/usb-*'))
+    if ports:
+        return ports
+    return sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
+
+
+def board_label(port):
+    """/dev/serial/by-id/usb-Arduino_..._A1B2C3D4-if00 -> A1B2C3D4 (シリアル番号)"""
+    base = os.path.basename(port)
+    if base.startswith('usb-'):
+        base = re.sub(r'-if\d+$', '', base[4:])
+        return base.split('_')[-1]
+    return port  # /dev/ttyACM0 などはそのまま
+
+
+def by_path_name(port):
+    """同じデバイスを指す /dev/serial/by-path/ の名前 (ラズパイの物理ポート位置)"""
+    real = os.path.realpath(port)
+    for p in glob.glob('/dev/serial/by-path/*'):
+        if os.path.realpath(p) == real:
+            return os.path.basename(p)
+    return ''
 
 
 class ClockModel:
@@ -94,6 +132,7 @@ class PortWorker(threading.Thread):
     def __init__(self, port, out_queue, stop_event):
         super().__init__(daemon=True, name=port)
         self.port = port
+        self.label = board_label(port)
         self.out_queue = out_queue
         self.stop_event = stop_event
         self.ser = None
@@ -150,7 +189,7 @@ class PortWorker(threading.Thread):
                 if est is None:
                     est = recv_ns  # 較正前(開始直後~0.5s)のみ受信時刻で代用
                 self.out_queue.put({
-                    'type': 'E', 'est_event_ns': est, 'port': self.port,
+                    'type': 'E', 'est_event_ns': est, 'port': self.label,
                     'device_us': device_us, 'adc': adc,
                 })
 
@@ -176,7 +215,7 @@ class PortWorker(threading.Thread):
                     self.clock.add(device_us, mid_ns)
                     self.last_used_ns = recv_ns
                 self.out_queue.put({
-                    'type': 'S', 'host_recv_ns': recv_ns, 'port': self.port,
+                    'type': 'S', 'host_recv_ns': recv_ns, 'port': self.label,
                     'device_us': device_us, 'mid_host_ns': mid_ns,
                     'rtt_us': rtt_ns // 1000, 'used': int(used),
                 })
@@ -196,15 +235,31 @@ def main():
     ap.add_argument('--hours', type=float, default=0.0, help='記録時間[時間] (0で無制限, 既定は無制限)')
     args = ap.parse_args()
 
-    ports = args.ports or sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
+    ports = args.ports or find_ports()
     if not ports:
         print('シリアルポートが見つかりません', file=sys.stderr)
         sys.exit(1)
-    print(f'使用ポート: {", ".join(ports)}')
+    print('使用ポート:')
+    for p in ports:
+        print(f'  {board_label(p)}  ({p})')
 
     out_name = args.out or time.strftime('coincidence_%Y%m%d_%H%M%S.csv')
     base = out_name[:-4] if out_name.endswith('.csv') else out_name
     sync_name = base + '_sync.csv'
+    ports_name = base + '_ports.csv'
+
+    # ボード固有名・物理ポート位置・実デバイスの対応表を書き出す
+    with open(ports_name, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['port', 'by_id', 'by_path', 'dev'])
+        for p in ports:
+            is_by_id = '/by-id/' in p
+            w.writerow([board_label(p),
+                        os.path.basename(p) if is_by_id else '',
+                        by_path_name(p),
+                        os.path.realpath(p)])
+        f.flush()
+        os.fsync(f.fileno())
     stop_event = threading.Event()
     q = queue.Queue()
 
@@ -229,6 +284,10 @@ def main():
     try:
         with open(out_name, 'w', newline='') as f_ev, \
              open(sync_name, 'w', newline='') as f_sy:
+            # ボードと物理ポートの対応をコメント行として先頭に残す (保険)
+            for p in ports:
+                f_ev.write(f'# board {board_label(p)} at {by_path_name(p) or "?"}'
+                           f' ({os.path.realpath(p)})\n')
             ev_writer = csv.DictWriter(f_ev, fieldnames=event_fields)
             ev_writer.writeheader()
             sy_writer = csv.DictWriter(f_sy, fieldnames=sync_fields)
