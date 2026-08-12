@@ -55,6 +55,7 @@ BOOT_WAIT_S = 2.5          # ポートを開くとボードがリセットされ
 MICROS_WRAP = 2 ** 32      # micros() の一周
 CAL_POINTS = 10            # フィットに使う直近の同期点数
 RTT_ACCEPT_NS = 4_000_000  # RTTがこれ(4ms)を超える同期点は較正に使わない
+STALE_ACCEPT_NS = 10_000_000_000  # ただし10s以上採用点がない場合はRTTが大きくても受け入れる
 
 
 class ClockModel:
@@ -100,6 +101,7 @@ class PortWorker(threading.Thread):
         self.last_micros = None
         self.clock = ClockModel()
         self.pending_sync_ns = None
+        self.last_used_ns = None
         self.lock = threading.Lock()
 
     def open(self):
@@ -166,10 +168,13 @@ class PortWorker(threading.Thread):
                 rtt_ns = recv_ns - t_send
                 mid_ns = t_send + rtt_ns // 2
                 # RTTが大きい同期点は中点の不確かさも大きいので較正から除外
-                # (ただし較正点がまだ少ないうちは受け入れる)
-                used = rtt_ns <= RTT_ACCEPT_NS or len(self.clock.points) < 2
+                # (較正点がまだ少ない/しばらく採用がない場合は受け入れる)
+                stale = (self.last_used_ns is None
+                         or recv_ns - self.last_used_ns > STALE_ACCEPT_NS)
+                used = rtt_ns <= RTT_ACCEPT_NS or len(self.clock.points) < 2 or stale
                 if used:
                     self.clock.add(device_us, mid_ns)
+                    self.last_used_ns = recv_ns
                 self.out_queue.put({
                     'type': 'S', 'host_recv_ns': recv_ns, 'port': self.port,
                     'device_us': device_us, 'mid_host_ns': mid_ns,
@@ -234,15 +239,17 @@ def main():
                 if deadline and now >= deadline:
                     print('指定時間に達したので停止します')
                     break
-                # 起動直後は密に同期してドリフト(傾き)を早く確定させる
-                interval = STARTUP_SYNC_INTERVAL_S if n_syncs < STARTUP_SYNCS else SYNC_INTERVAL_S
-                if now - last_sync >= interval:
+                # 同時送信するとUSBバス上で応答が競合してRTTが膨らむので、
+                # ポートごとに時間をずらして1台ずつ同期する (ラウンドロビン)。
+                # 起動直後は密に同期してドリフト(傾き)を早く確定させる。
+                period = (STARTUP_SYNC_INTERVAL_S
+                          if n_syncs < STARTUP_SYNCS * len(workers) else SYNC_INTERVAL_S)
+                if now - last_sync >= period / len(workers):
                     last_sync = now
+                    workers[n_syncs % len(workers)].send_sync()
                     n_syncs += 1
-                    for w in workers:
-                        w.send_sync()
                 try:
-                    row = q.get(timeout=0.5)
+                    row = q.get(timeout=0.1)
                 except queue.Empty:
                     continue
                 kind = row.pop('type')
